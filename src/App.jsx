@@ -4,7 +4,7 @@ import { auth, db, googleProvider } from './firebase';
 import { signInWithPopup, signOut, onAuthStateChanged } from 'firebase/auth';
 import { doc, setDoc, onSnapshot } from 'firebase/firestore';
 
-// === 기존 유틸리티 (사운드, Confetti, 상수들) ===
+// === Sound ===
 const playSound = (type) => {
   const AC = window.AudioContext || window.webkitAudioContext;
   if (!AC) return;
@@ -32,6 +32,7 @@ const playSound = (type) => {
   }
 };
 
+// === Confetti ===
 const Confetti = ({ onComplete }) => {
   useEffect(() => { const t = setTimeout(onComplete, 3000); return () => clearTimeout(t); }, [onComplete]);
   const particles = React.useMemo(() => [...Array(50)].map((_, i) => ({
@@ -42,17 +43,14 @@ const Confetti = ({ onComplete }) => {
   return (
     <div style={{ position: 'fixed', inset: 0, pointerEvents: 'none', zIndex: 50 }}>
       {particles.map(p => (
-        <div key={p.id} style={{
-          position: 'absolute', left: p.left, top: '-20px', backgroundColor: p.color,
-          width: '10px', height: '10px', borderRadius: '50%',
-          animation: `cf ${p.duration}s linear forwards`, animationDelay: `${p.delay}s`,
-        }} />
+        <div key={p.id} style={{ position: 'absolute', left: p.left, top: '-20px', backgroundColor: p.color, width: '10px', height: '10px', borderRadius: '50%', animation: `cf ${p.duration}s linear forwards`, animationDelay: `${p.delay}s` }} />
       ))}
       <style>{`@keyframes cf { to { transform: translateY(100vh) rotate(360deg); opacity: 0; } }`}</style>
     </div>
   );
 };
 
+// === Constants ===
 const SHOP_CATEGORIES = [
   { name: 'Everyday Perks', desc: 'No title required' },
   { name: 'Special Treats', desc: 'Requires Junior Warrior+' },
@@ -94,6 +92,9 @@ export default function App() {
   const [activeUser, setActiveUser] = useState('Penelope');
   const [players, setPlayers] = useState(DEFAULT_PLAYERS);
   const [isLoaded, setIsLoaded] = useState(false);
+  // ★ FIX 1: 데이터를 성공적으로 불러왔는지 추적하는 플래그
+  const [dataFromServer, setDataFromServer] = useState(false);
+
   const [currentTab, setCurrentTab] = useState('bag');
   const [showConfetti, setShowConfetti] = useState(false);
   const [couponIndexToUse, setCouponIndexToUse] = useState(null);
@@ -103,16 +104,41 @@ export default function App() {
   const [showLevelUp, setShowLevelUp] = useState(false);
   const [message, setMessage] = useState('');
 
-  // --- 구글 로그인 상태 추적 ---
+  // ★ FIX 2: 날짜 자동 갱신 — 앱이 백그라운드에서 돌아올 때 화면 새로고침
+  const [todayDate, setTodayDate] = useState(getToday());
+
   useEffect(() => {
-    const unsub = onAuthStateChanged(auth, (u) => {
-      setUser(u);
-      setAuthLoading(false);
-    });
+    const handleVisibility = () => {
+      if (!document.hidden) {
+        const newToday = getToday();
+        if (newToday !== todayDate) {
+          setTodayDate(newToday);
+        }
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+
+    // 1분마다 날짜 체크 (자정 넘김 대비)
+    const interval = setInterval(() => {
+      const newToday = getToday();
+      if (newToday !== todayDate) {
+        setTodayDate(newToday);
+      }
+    }, 60000);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibility);
+      clearInterval(interval);
+    };
+  }, [todayDate]);
+
+  // Auth
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, (u) => { setUser(u); setAuthLoading(false); });
     return () => unsub();
   }, []);
 
-  // --- Firestore에서 데이터 실시간 불러오기 ---
+  // ★ FIX 1: Firestore 데이터 로딩 — 기본값 덮어쓰기 방지
   useEffect(() => {
     if (!user) { setIsLoaded(true); return; }
     const ref = doc(db, 'families', user.uid);
@@ -121,22 +147,34 @@ export default function App() {
         const data = snap.data();
         if (data.players) setPlayers(data.players);
         if (data.activeUser) setActiveUser(data.activeUser);
+        setDataFromServer(true); // ★ 서버 데이터 로드 성공
       } else {
-        // 처음 로그인 시 기본 데이터 저장
+        // 첫 로그인 시에만 기본 데이터 저장
         setDoc(ref, { players: DEFAULT_PLAYERS, activeUser: 'Penelope' });
+        setDataFromServer(true);
       }
       setIsLoaded(true);
+    }, (error) => {
+      // ★ FIX 1: 로드 실패 시 기본값을 서버에 저장하지 않음
+      console.error("Firestore load error:", error);
+      setIsLoaded(true);
+      // dataFromServer는 false로 유지 → 저장 차단
     });
     return () => unsub();
   }, [user]);
 
+  // ★ FIX 1: 서버 데이터가 로드되지 않았으면 저장 차단
   const saveState = useCallback(async (newPlayers, newActiveUser) => {
     setPlayers(newPlayers);
     setActiveUser(newActiveUser);
-    if (user) {
-      await setDoc(doc(db, 'families', user.uid), { players: newPlayers, activeUser: newActiveUser }, { merge: true });
+    if (user && dataFromServer) {
+      try {
+        await setDoc(doc(db, 'families', user.uid), { players: newPlayers, activeUser: newActiveUser }, { merge: true });
+      } catch (error) {
+        console.error("Save failed:", error);
+      }
     }
-  }, [user]);
+  }, [user, dataFromServer]);
 
   const triggerAlert = useCallback((t) => { setMessage(t); setTimeout(() => setMessage(''), 3000); }, []);
 
@@ -144,15 +182,15 @@ export default function App() {
     try { await signInWithPopup(auth, googleProvider); }
     catch (e) { console.error(e); triggerAlert('Login failed'); }
   };
+  const handleLogout = async () => { setDataFromServer(false); await signOut(auth); };
 
-  const handleLogout = async () => { await signOut(auth); };
-
-  // --- Actions (기존 로직 유지) ---
+  // --- Actions ---
   const handleDailyMission = () => {
     const up = players[activeUser];
     const inv = normalizeInventory(up.inventory);
     const hist = up.history || [];
-    if (hist.some(h => h.date === getToday() && h.type === 'daily')) {
+    // ★ FIX 2: todayDate 상태값 사용 (실시간 갱신됨)
+    if (hist.some(h => h.date === todayDate && h.type === 'daily')) {
       triggerAlert("Today's mission already done! ✅"); return;
     }
     let nExp = up.exp + 20, nLv = up.level, nCoins = up.coins + 50, leveled = false, titleCh = false;
@@ -160,7 +198,7 @@ export default function App() {
       nExp = 0; nLv += 1; leveled = true;
       if (getTitle(nLv).text !== getTitle(up.level).text) titleCh = true;
     } else triggerAlert('Daily Mission Complete! +20 EXP, +50 Coins, +1 Coupon! 🌟');
-    const entry = { id: Date.now(), date: getToday(), type: 'daily', description: 'Daily Mission Complete', rewards: '+20 EXP, +50 Coins, +1 Coupon', levelAfter: nLv };
+    const entry = { id: Date.now(), date: todayDate, type: 'daily', description: 'Daily Mission Complete', rewards: '+20 EXP, +50 Coins, +1 Coupon', levelAfter: nLv };
     const nP = { ...players, [activeUser]: { ...up, inventory: [...inv, { name: 'Roblox 30 Minutes', icon: '🎮', color: 'bg-blue-100' }], exp: nExp, level: nLv, coins: nCoins, history: [...hist, entry] } };
     saveState(nP, activeUser);
     setShowParentModal(false);
@@ -211,7 +249,7 @@ export default function App() {
       const inv = normalizeInventory(up.inventory);
       const po = up.purchasedOneTimeItems || [];
       const hist = up.history || [];
-      const entry = { id: Date.now(), date: getToday(), type: 'purchase', description: `Purchased: ${item.name}`, rewards: `-${item.price} Coins` };
+      const entry = { id: Date.now(), date: todayDate, type: 'purchase', description: `Purchased: ${item.name}`, rewards: `-${item.price} Coins` };
       saveState({ ...players, [activeUser]: { ...up, coins: up.coins - item.price, inventory: [...inv, { name: item.name, icon: item.icon, color: item.color }], purchasedOneTimeItems: item.oneTime ? [...po, item.id] : po, history: [...hist, entry] } }, activeUser);
       playSound('coupon'); triggerAlert(`Purchased: ${item.name}! 🎉`);
     }
@@ -229,7 +267,7 @@ export default function App() {
       const used = inv[couponIndexToUse];
       const nInv = [...inv]; nInv.splice(couponIndexToUse, 1);
       const hist = players[activeUser].history || [];
-      const entry = { id: Date.now(), date: getToday(), type: 'used', description: `Used: ${used.name || 'Coupon'}`, rewards: '' };
+      const entry = { id: Date.now(), date: todayDate, type: 'used', description: `Used: ${used.name || 'Coupon'}`, rewards: '' };
       saveState({ ...players, [activeUser]: { ...players[activeUser], inventory: nInv, history: [...hist, entry] } }, activeUser);
       playSound('coupon'); setShowConfetti(true); setCouponIndexToUse(null); triggerAlert('Coupon Used! 🎉');
     }
@@ -242,7 +280,7 @@ export default function App() {
   };
   const getBg = (c) => colorMap[c] || '#f3f4f6';
 
-  // --- 로딩 ---
+  // --- Loading ---
   if (authLoading || (user && !isLoaded)) {
     return (
       <div style={{ minHeight: '100vh', background: '#eef2ff', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 16 }}>
@@ -252,7 +290,7 @@ export default function App() {
     );
   }
 
-  // --- 로그인 화면 ---
+  // --- Login ---
   if (!user) {
     return (
       <div style={{ minHeight: '100vh', background: 'linear-gradient(135deg, #eef2ff, #e0e7ff)', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: 24, fontFamily: "'Nunito', sans-serif" }}>
@@ -268,11 +306,26 @@ export default function App() {
     );
   }
 
+  // ★ FIX 1: 서버 데이터 로드 실패 시 에러 표시 (기본값으로 동작하지 않음)
+  if (!dataFromServer) {
+    return (
+      <div style={{ minHeight: '100vh', background: '#eef2ff', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 16, padding: 24, fontFamily: "'Nunito', sans-serif" }}>
+        <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@700;800;900&display=swap" rel="stylesheet" />
+        <div style={{ fontSize: 48 }}>⚠️</div>
+        <h2 style={{ fontSize: 20, fontWeight: 900, color: '#4f46e5', textAlign: 'center' }}>Loading your data...</h2>
+        <p style={{ fontSize: 13, color: '#6b7280', textAlign: 'center', maxWidth: 300 }}>If this takes too long, please check your internet connection and refresh the page.</p>
+        <button onClick={() => window.location.reload()} style={{ padding: '12px 24px', background: '#4f46e5', color: '#fff', border: 'none', borderRadius: 14, fontWeight: 800, cursor: 'pointer', fontSize: 14 }}>Refresh</button>
+        <button onClick={handleLogout} style={{ padding: '10px 20px', background: '#f3f4f6', color: '#6b7280', border: 'none', borderRadius: 14, fontWeight: 700, cursor: 'pointer', fontSize: 13, marginTop: 8 }}>Logout</button>
+      </div>
+    );
+  }
+
   const cur = players[activeUser];
   const curTitle = getTitle(cur.level);
   const curInv = normalizeInventory(cur.inventory);
   const curHist = cur.history || [];
-  const isTodayDone = curHist.some(h => h.date === getToday() && h.type === 'daily');
+  // ★ FIX 2: todayDate 상태값 사용
+  const isTodayDone = curHist.some(h => h.date === todayDate && h.type === 'daily');
 
   return (
     <div style={{ minHeight: '100vh', background: '#eef2ff', fontFamily: "'Nunito', sans-serif", color: '#1f2937', paddingBottom: 100, userSelect: 'none' }}>
@@ -472,13 +525,13 @@ export default function App() {
             <div style={{ background: '#fffbeb', padding: 16, borderRadius: 24, border: '2px solid #fde68a' }}>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 14 }}>
                 {[
-                  { l: '+ 20 EXP', c: '#4f46e5', a: () => handleManualStat(20, 0, '+20 EXP') },
-                  { l: '- 20 EXP', c: '#ef4444', a: () => handleManualStat(-20, 0, '-20 EXP') },
-                  { l: '+ 50 Coins', c: '#b45309', a: () => handleManualStat(0, 50, '+50 Coins') },
-                  { l: '- 50 Coins', c: '#ef4444', a: () => handleManualStat(0, -50, '-50 Coins') },
-                  { l: '+ 1 Coupon', c: '#7c3aed', a: () => handleManualCoupon(1, '+1 Coupon') },
-                  { l: '- 1 Coupon', c: '#ef4444', a: () => handleManualCoupon(-1, '-1 Coupon') },
-                ].map((b, i) => <button key={i} onClick={b.a} style={{ padding: '10px 0', background: '#fff', color: b.c, borderRadius: 16, fontWeight: 900, fontSize: 11, border: '1px solid #e5e7eb', cursor: 'pointer' }}>[{b.l}]</button>)}
+                  { l: '+20 EXP', c: '#4f46e5', a: () => handleManualStat(20, 0, '+20 EXP ✨') },
+                  { l: '-20 EXP', c: '#ef4444', a: () => handleManualStat(-20, 0, '-20 EXP 📉') },
+                  { l: '+50 🪙', c: '#b45309', a: () => handleManualStat(0, 50, '+50 🪙') },
+                  { l: '-50 🪙', c: '#ef4444', a: () => handleManualStat(0, -50, '-50 🪙') },
+                  { l: '+🎟️', c: '#7c3aed', a: () => handleManualCoupon(1, '+1 🎟️') },
+                  { l: '-🎟️', c: '#ef4444', a: () => handleManualCoupon(-1, '-1 🎟️') },
+                ].map((b, i) => <button key={i} onClick={b.a} style={{ padding: '10px 0', background: '#fff', color: b.c, borderRadius: 16, fontWeight: 900, fontSize: 11, border: '1px solid #e5e7eb', cursor: 'pointer' }}>{b.l}</button>)}
               </div>
               <button onClick={handleDailyMission} disabled={isTodayDone} style={{ width: '100%', background: isTodayDone ? '#f0fdf4' : '#fff', padding: 12, borderRadius: 16, border: `1px solid ${isTodayDone ? '#86efac' : '#e0e7ff'}`, cursor: isTodayDone ? 'default' : 'pointer', display: 'flex', gap: 12, alignItems: 'center', marginBottom: 8 }}>
                 <div style={{ width: 40, height: 40, background: isTodayDone ? '#dcfce7' : '#eef2ff', borderRadius: 12, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 18 }}>{isTodayDone ? '✅' : '🌟'}</div>
